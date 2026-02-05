@@ -129,6 +129,77 @@ class Type(pydantic.BaseModel):
         """
         return None
 
+    # =========================================================================
+    # RLM Sandbox Support (Optional)
+    #
+    # These methods allow custom types to opt-in to RLM sandbox injection.
+    # Types that don't implement these will use default JSON serialization.
+    # =========================================================================
+
+    def sandbox_setup(self) -> str:
+        """Return one-time setup code (imports) needed in the RLM sandbox.
+
+        This code is executed once when the sandbox initializes. Override this
+        to import libraries needed to work with your type in the sandbox.
+
+        Returns:
+            Python code string for sandbox setup (e.g., "import pandas as pd")
+        """
+        return ""
+
+    def to_sandbox(self, var_name: str) -> tuple[str, bytes | None, str]:
+        """Serialize this type for injection into the RLM sandbox.
+
+        Override this to provide custom serialization for RLM. The default
+        implementation returns None to signal that JSON serialization should be used.
+
+        Args:
+            var_name: The variable name this will be assigned to in the sandbox
+
+        Returns:
+            Tuple of:
+            - assignment_code: Python code to assign the variable
+            - binary_payload: Optional binary data (raw bytes, base64-encoded by caller)
+            - format: Format identifier ("json", "parquet", etc.)
+
+            Or (None, None, None) to use default JSON serialization.
+        """
+        return None, None, None
+
+    @classmethod
+    def from_sandbox(cls, data: Any) -> Optional["Type"]:
+        """Reconstruct this type from RLM sandbox output.
+
+        Override this to handle reconstruction of your type from sandbox results.
+
+        Args:
+            data: Raw data returned from the sandbox
+
+        Returns:
+            Reconstructed instance of this type, or None to use default handling.
+        """
+        return None
+
+    def rlm_preview(self, max_chars: int = 500) -> str:
+        """Generate an LLM-friendly preview for RLM prompts.
+
+        This provides a human-readable summary that helps the LLM understand
+        what data is available in the variable. Override for custom previews.
+
+        Args:
+            max_chars: Maximum characters in preview
+
+        Returns:
+            String preview suitable for LLM consumption
+        """
+        try:
+            formatted = self.format()
+            if isinstance(formatted, str):
+                return formatted[:max_chars]
+            return f"{self.__class__.__name__} instance"[:max_chars]
+        except NotImplementedError:
+            return repr(self)[:max_chars]
+
 
 def split_message_content_for_custom_types(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Split user message content into a list of content blocks.

@@ -6,6 +6,7 @@ WASM environment using Deno and Pyodide. It implements the Interpreter
 protocol defined in interpreter.py.
 """
 
+import base64
 import functools
 import inspect
 import json
@@ -16,6 +17,15 @@ import subprocess
 import threading
 from os import PathLike
 from typing import Any, Callable
+
+
+def _has_rlm_support(value: Any) -> bool:
+    """Check if a value is a dspy.Type with RLM sandbox support.
+
+    Returns True if the value has a to_sandbox() method that can handle
+    its own serialization for the RLM sandbox.
+    """
+    return hasattr(value, 'to_sandbox') and callable(getattr(value, 'to_sandbox', None))
 
 from dspy.primitives.code_interpreter import SIMPLE_TYPES, CodeInterpreterError, FinalOutput
 
@@ -391,14 +401,35 @@ class PythonInterpreter:
             raise CodeInterpreterError(f"Unsupported value type: {type(value).__name__}")
 
     def _inject_variables(self, code: str, variables: dict[str, Any]) -> str:
-        """Insert Python assignments for each variable at the top of the code."""
+        """Insert Python assignments for each variable at the top of the code.
+
+        Supports dspy.Type instances with RLM sandbox support via to_sandbox(),
+        with fallback to JSON serialization for other types.
+        """
         for key in variables:
             if not key.isidentifier() or keyword.iskeyword(key) or key == "json":
                 raise CodeInterpreterError(f"Invalid variable name: '{key}'")
 
+        # Variables with custom RLM serialization (via to_sandbox interface)
+        rlm_type_vars: dict[str, tuple[str, bytes, str]] = {}  # name -> (code, bytes, format)
         large_vars = {}
         small_assignments = []
+        setup_imports = set()
+
         for k, v in variables.items():
+            # Check for dspy.Type with RLM support first
+            if _has_rlm_support(v):
+                assignment_code, payload, fmt = v.to_sandbox(k)
+                if assignment_code is not None:
+                    rlm_type_vars[k] = (assignment_code, payload, fmt)
+                    # Collect setup imports
+                    if hasattr(v, 'sandbox_setup'):
+                        setup = v.sandbox_setup()
+                        if setup:
+                            setup_imports.add(setup)
+                    continue
+
+            # Standard serialization for other types
             serialized = self._serialize_value(v)
             if len(serialized) > LARGE_VAR_THRESHOLD:
                 large_vars[k] = json.dumps(self._to_json_compatible(v))
@@ -406,12 +437,23 @@ class PythonInterpreter:
                 small_assignments.append(f"{k} = {serialized}")
 
         self._pending_large_vars = large_vars
+        self._pending_rlm_type_vars = rlm_type_vars
 
+        # Build imports
+        imports = list(setup_imports)
         if large_vars:
-            large_assignments = [f"{k} = json.loads(open('/tmp/dspy_vars/{k}.json').read())" for k in large_vars]
-            assignments = ["import json"] + small_assignments + large_assignments
-        else:
-            assignments = small_assignments
+            imports.append("import json")
+
+        # Build assignments for large JSON vars
+        large_assignments = [
+            f"{k} = json.loads(open('/tmp/dspy_vars/{k}.json').read())"
+            for k in large_vars
+        ]
+
+        # Build assignments for RLM type vars (code is already complete)
+        rlm_assignments = [code for code, _, _ in rlm_type_vars.values()]
+
+        assignments = imports + small_assignments + large_assignments + rlm_assignments
 
         return "\n".join(assignments) + "\n" + code if assignments else code
 
@@ -451,9 +493,15 @@ class PythonInterpreter:
         else:
             raise CodeInterpreterError(f"Unsupported value type: {type(value).__name__}")
 
-    def _inject_large_var(self, name: str, value: str) -> None:
-        """Inject a large variable via the virtual filesystem."""
-        self._send_request("inject_var", {"name": name, "value": value}, f"injecting variable '{name}'")
+    def _inject_large_var(self, name: str, value: str, format: str = "json") -> None:
+        """Inject a large variable via the virtual filesystem.
+
+        Args:
+            name: Variable name
+            value: Serialized value (JSON string or base64-encoded bytes)
+            format: Either "json" or "parquet"
+        """
+        self._send_request("inject_var", {"name": name, "value": value, "format": format}, f"injecting variable '{name}'")
 
     def execute(
         self,
@@ -468,7 +516,13 @@ class PythonInterpreter:
         self._register_tools()
 
         for name, value in self._pending_large_vars.items():
-            self._inject_large_var(name, value)
+            self._inject_large_var(name, value, format="json")
+
+        # Inject RLM type variables via their custom format
+        for name, (_, payload, fmt) in getattr(self, '_pending_rlm_type_vars', {}).items():
+            if payload is not None:
+                encoded = base64.b64encode(payload).decode("ascii")
+                self._inject_large_var(name, encoded, format=fmt)
 
         # Send the code as JSON-RPC request
         self._request_id += 1
@@ -485,7 +539,11 @@ class PythonInterpreter:
             self._mount_files()
             self._register_tools()
             for name, value in self._pending_large_vars.items():
-                self._inject_large_var(name, value)
+                self._inject_large_var(name, value, format="json")
+            for name, (_, payload, fmt) in getattr(self, '_pending_rlm_type_vars', {}).items():
+                if payload is not None:
+                    encoded = base64.b64encode(payload).decode("ascii")
+                    self._inject_large_var(name, encoded, format=fmt)
             self.deno_process.stdin.write(input_data + "\n")
             self.deno_process.stdin.flush()
 

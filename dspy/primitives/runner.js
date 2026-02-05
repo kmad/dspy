@@ -308,11 +308,22 @@ while (true) {
   }
 
   if (method === "inject_var") {
-    const { name, value } = params;
+    const { name, value, format } = params;
     try {
       try { pyodide.FS.mkdir('/tmp'); } catch (e) { /* exists */ }
       try { pyodide.FS.mkdir('/tmp/dspy_vars'); } catch (e) { /* exists */ }
-      pyodide.FS.writeFile(`/tmp/dspy_vars/${name}.json`, new TextEncoder().encode(value));
+
+      if (format === "parquet") {
+        // Pre-load pyarrow for parquet support (pandas needs it for read_parquet)
+        await pyodide.loadPackage(["pandas", "pyarrow"]);
+        // Decode base64 directly to Uint8Array using Deno's built-in decoder
+        const binaryData = Uint8Array.from(atob(value), c => c.charCodeAt(0));
+        pyodide.FS.writeFile(`/tmp/dspy_vars/${name}.parquet`, binaryData);
+      } else {
+        // Default: write JSON as text
+        pyodide.FS.writeFile(`/tmp/dspy_vars/${name}.json`, new TextEncoder().encode(value));
+      }
+
       console.log(jsonrpcResult({ injected: name }, requestId));
     } catch (e) {
       console.log(jsonrpcError(JSONRPC_APP_ERRORS.RuntimeError, `Failed to inject var: ${e.message}`, requestId));
