@@ -27,6 +27,27 @@ def _has_rlm_support(value: Any) -> bool:
     """
     return hasattr(value, 'to_sandbox') and callable(getattr(value, 'to_sandbox', None))
 
+
+def _is_raw_pandas_dataframe(value: Any) -> bool:
+    """Check if value is a raw pandas DataFrame (not already wrapped in dspy.DataFrame)."""
+    t = type(value)
+    return getattr(t, "__module__", "").startswith("pandas") and t.__name__ == "DataFrame"
+
+
+def _try_wrap_for_rlm(value: Any) -> Any:
+    """Attempt to wrap a raw value in its dspy.Type wrapper for RLM support.
+
+    Currently handles raw pandas DataFrames by wrapping in dspy.DataFrame.
+    Returns the original value if wrapping is not applicable or fails.
+    """
+    if _is_raw_pandas_dataframe(value):
+        try:
+            from dspy.adapters.types.dataframe import DataFrame as DspyDataFrame
+            return DspyDataFrame(value)
+        except Exception:
+            pass
+    return value
+
 from dspy.primitives.code_interpreter import SIMPLE_TYPES, CodeInterpreterError, FinalOutput
 
 __all__ = ["PythonInterpreter", "FinalOutput", "CodeInterpreterError"]
@@ -417,7 +438,11 @@ class PythonInterpreter:
         setup_imports = set()
 
         for k, v in variables.items():
-            # Check for dspy.Type with RLM support first
+            # Auto-wrap known types (e.g., raw pandas DataFrame -> dspy.DataFrame)
+            if not _has_rlm_support(v):
+                v = _try_wrap_for_rlm(v)
+
+            # Check for dspy.Type with RLM support (including auto-wrapped values)
             if _has_rlm_support(v):
                 assignment_code, payload, fmt = v.to_sandbox(k)
                 if assignment_code is not None:
@@ -521,8 +546,13 @@ class PythonInterpreter:
         # Inject RLM type variables via their custom format
         for name, (_, payload, fmt) in getattr(self, '_pending_rlm_type_vars', {}).items():
             if payload is not None:
-                encoded = base64.b64encode(payload).decode("ascii")
-                self._inject_large_var(name, encoded, format=fmt)
+                if fmt == "parquet":
+                    # Binary formats: base64-encode for transport (runner.js decodes via atob)
+                    value = base64.b64encode(payload).decode("ascii")
+                else:
+                    # Text formats (JSON): send as string (runner.js writes as-is)
+                    value = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+                self._inject_large_var(name, value, format=fmt)
 
         # Send the code as JSON-RPC request
         self._request_id += 1
@@ -542,8 +572,11 @@ class PythonInterpreter:
                 self._inject_large_var(name, value, format="json")
             for name, (_, payload, fmt) in getattr(self, '_pending_rlm_type_vars', {}).items():
                 if payload is not None:
-                    encoded = base64.b64encode(payload).decode("ascii")
-                    self._inject_large_var(name, encoded, format=fmt)
+                    if fmt == "parquet":
+                        value = base64.b64encode(payload).decode("ascii")
+                    else:
+                        value = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+                    self._inject_large_var(name, value, format=fmt)
             self.deno_process.stdin.write(input_data + "\n")
             self.deno_process.stdin.flush()
 

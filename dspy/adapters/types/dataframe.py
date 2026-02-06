@@ -216,7 +216,7 @@ class DataFrame(Type):
 
     def sandbox_setup(self) -> str:
         """Return setup code for pandas in the sandbox."""
-        return "import pandas as pd\nimport orjson"
+        return "import pandas as pd\nimport json"
 
     def to_sandbox(self, var_name: str) -> tuple[str, bytes | None, str]:
         """Serialize DataFrame to JSON for sandbox injection.
@@ -238,10 +238,11 @@ class DataFrame(Type):
             return None, None, None
 
         json_bytes = _serialize_df_to_json(self.data)
-        
+
         # Generate code that reads and reconstructs the DataFrame
-        assignment_code = f'''{var_name} = pd.DataFrame(orjson.loads(open('/tmp/dspy_vars/{var_name}.json', 'rb').read())['records'])'''
-        
+        # Use stdlib json (not orjson) since orjson is not available in Pyodide/WASM
+        assignment_code = f'''{var_name} = pd.DataFrame(json.loads(open('/tmp/dspy_vars/{var_name}.json').read())['records'])'''
+
         return assignment_code, json_bytes, "json"
 
     @classmethod

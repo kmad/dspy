@@ -16,8 +16,26 @@ old_stdout, old_stderr = sys.stdout, sys.stderr
 buf_stdout, buf_stderr = io.StringIO(), io.StringIO()
 sys.stdout, sys.stderr = buf_stdout, buf_stderr
 
+def _to_native(obj):
+    """Convert numpy/pandas types to native Python for JSON serialization."""
+    if isinstance(obj, dict):
+        return {str(k): _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_native(v) for v in obj)
+    if hasattr(obj, 'item'):  # numpy scalar (int64, float64, etc.)
+        return obj.item()
+    if hasattr(obj, 'tolist') and not isinstance(obj, str):
+        result = obj.tolist()
+        return _to_native(result) if isinstance(result, (list, dict)) else result
+    return obj
+
 def last_exception_args():
-    return json.dumps(sys.last_exc.args) if sys.last_exc else None
+    if not sys.last_exc:
+        return None
+    try:
+        return json.dumps(_to_native(sys.last_exc.args))
+    except (TypeError, ValueError):
+        return json.dumps([str(a) for a in sys.last_exc.args])
 
 class FinalOutput(BaseException):
     # Control-flow exception to signal completion (like StopIteration)
@@ -27,7 +45,7 @@ class FinalOutput(BaseException):
 # Only define if not already registered with typed signatures.
 if 'SUBMIT' not in dir():
     def SUBMIT(output):
-        raise FinalOutput({"output": output})
+        raise FinalOutput({"output": _to_native(output)})
 `;
 
 // Generate a tool wrapper function with typed signature.
@@ -79,7 +97,7 @@ const makeSubmitWrapper = (outputs) => {
     // Fallback to single-arg SUBMIT if no outputs defined
     return `
 def SUBMIT(output):
-    raise FinalOutput({"output": output})
+    raise FinalOutput({"output": _to_native(output)})
 `;
   }
 
@@ -88,7 +106,7 @@ def SUBMIT(output):
     if (o.type) part += `: ${o.type}`;
     return part;
   });
-  const dictParts = outputs.map(o => `"${o.name}": ${o.name}`);
+  const dictParts = outputs.map(o => `"${o.name}": _to_native(${o.name})`);
 
   return `
 def SUBMIT(${sigParts.join(', ')}):
@@ -356,21 +374,29 @@ while (true) {
 
       // Handle FinalOutput as a success result, not an error
       if (errorType === "FinalOutput") {
-        const last_exception_args = pyodide.globals.get("last_exception_args");
-        const errorArgs = JSON.parse(last_exception_args()) || [];
-        const answer = errorArgs[0] || null;
-        console.log(jsonrpcResult({ final: answer }, requestId));
+        try {
+          const last_exception_args = pyodide.globals.get("last_exception_args");
+          const errorArgs = JSON.parse(last_exception_args()) || [];
+          const answer = errorArgs[0] || null;
+          console.log(jsonrpcResult({ final: answer }, requestId));
+        } catch (serError) {
+          console.log(jsonrpcError(JSONRPC_APP_ERRORS.RuntimeError, `Failed to serialize SUBMIT output: ${serError.message}`, requestId));
+        }
         continue;
       }
 
       // Get error args for other exception types
       let errorArgs = [];
       if (errorType !== "SyntaxError") {
-        // Only python exceptions have args.
-        const last_exception_args = pyodide.globals.get("last_exception_args");
-        // Regarding https://pyodide.org/en/stable/usage/type-conversions.html#type-translations-errors,
-        // we do a additional `json.dumps` and `JSON.parse` on the values, to avoid the possible memory leak.
-        errorArgs = JSON.parse(last_exception_args()) || [];
+        try {
+          // Only python exceptions have args.
+          const last_exception_args = pyodide.globals.get("last_exception_args");
+          // Regarding https://pyodide.org/en/stable/usage/type-conversions.html#type-translations-errors,
+          // we do a additional `json.dumps` and `JSON.parse` on the values, to avoid the possible memory leak.
+          errorArgs = JSON.parse(last_exception_args()) || [];
+        } catch (serError) {
+          errorArgs = [errorMessage || "Unknown error (args not serializable)"];
+        }
       }
 
       // Map error type to JSON-RPC error code
