@@ -1,27 +1,23 @@
 """DataFrame type for DSPy signatures with RLM support.
 
-This implementation uses Parquet serialization with PyArrow to preserve all pandas
-data types when passing DataFrames to RLM sandbox environments.
+This implementation uses orjson serialization for efficient transfer of
+DataFrames to RLM sandbox environments without requiring additional dependencies.
 """
 
 import io
 from typing import Any
 
 import pydantic
+import orjson
 
 from dspy.adapters.types.base_type import Type
 
 try:
     import pandas as pd
+    import numpy as np
     PANDAS_AVAILABLE = True
 except ImportError:
     PANDAS_AVAILABLE = False
-
-try:
-    import pyarrow  # noqa: F401
-    PYARROW_AVAILABLE = True
-except ImportError:
-    PYARROW_AVAILABLE = False
 
 
 def _is_dataframe(value: Any) -> bool:
@@ -31,11 +27,97 @@ def _is_dataframe(value: Any) -> bool:
     return type_module.startswith("pandas") and type_name == "DataFrame"
 
 
+def _serialize_df_to_json(df: "pd.DataFrame") -> bytes:
+    """Serialize DataFrame to JSON bytes using orjson.
+    
+    Handles pandas/numpy types that orjson doesn't natively support by
+    converting to Python-native types first.
+    """
+    # Convert to records format with proper type handling
+    records = []
+    for _, row in df.iterrows():
+        record = {}
+        for col in df.columns:
+            val = row[col]
+            # Handle pandas NA/NaT/NaN
+            if pd.isna(val):
+                record[col] = None
+            # Handle numpy types
+            elif hasattr(val, 'item'):  # numpy scalar
+                record[col] = val.item()
+            # Handle Timestamp
+            elif isinstance(val, pd.Timestamp):
+                record[col] = val.isoformat()
+            # Handle Timedelta
+            elif isinstance(val, pd.Timedelta):
+                record[col] = str(val)
+            else:
+                record[col] = val
+        records.append(record)
+    
+    # Include dtype info for reconstruction
+    dtypes = {col: str(df[col].dtype) for col in df.columns}
+    
+    # Include index if it's not a simple RangeIndex
+    index_data = None
+    if not isinstance(df.index, pd.RangeIndex):
+        index_data = {
+            'values': [v.isoformat() if isinstance(v, pd.Timestamp) else v for v in df.index.tolist()],
+            'name': df.index.name
+        }
+    
+    payload = {
+        'records': records,
+        'dtypes': dtypes,
+        'index': index_data,
+        'columns': list(df.columns)
+    }
+    
+    return orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
+
+
+def _deserialize_json_to_df(json_bytes: bytes) -> "pd.DataFrame":
+    """Deserialize JSON bytes back to DataFrame with dtype restoration."""
+    payload = orjson.loads(json_bytes)
+    
+    records = payload['records']
+    dtypes = payload.get('dtypes', {})
+    index_data = payload.get('index')
+    columns = payload.get('columns', [])
+    
+    # Create DataFrame from records
+    df = pd.DataFrame(records, columns=columns if columns else None)
+    
+    # Restore dtypes where possible
+    for col, dtype_str in dtypes.items():
+        if col not in df.columns:
+            continue
+        try:
+            if 'datetime64' in dtype_str:
+                df[col] = pd.to_datetime(df[col])
+            elif 'category' in dtype_str:
+                df[col] = df[col].astype('category')
+            elif 'Int64' in dtype_str or 'Int32' in dtype_str:
+                df[col] = df[col].astype(dtype_str)
+            elif 'Float64' in dtype_str or 'Float32' in dtype_str:
+                df[col] = df[col].astype(dtype_str)
+            elif dtype_str == 'bool':
+                df[col] = df[col].astype(bool)
+        except (ValueError, TypeError):
+            pass  # Keep as-is if conversion fails
+    
+    # Restore index if present
+    if index_data:
+        df.index = pd.Index(index_data['values'], name=index_data.get('name'))
+    
+    return df
+
+
 class DataFrame(Type):
     """DataFrame type for DSPy signatures.
 
-    Wraps pandas DataFrames for use in DSPy signatures. Supports auto-wrapping
-    and attribute proxying for ergonomic usage.
+    Wraps pandas DataFrames for use in DSPy signatures. Uses orjson for
+    efficient serialization to RLM sandbox environments.
 
     WARNING: dspy.DataFrame should only be used with dspy.RLM, which provides
     a Python sandbox where the DataFrame is available for code execution.
@@ -134,52 +216,33 @@ class DataFrame(Type):
 
     def sandbox_setup(self) -> str:
         """Return setup code for pandas in the sandbox."""
-        return "import pandas as pd"
+        return "import pandas as pd\nimport orjson"
 
     def to_sandbox(self, var_name: str) -> tuple[str, bytes | None, str]:
-        """Serialize DataFrame to Parquet for sandbox injection.
+        """Serialize DataFrame to JSON for sandbox injection.
 
-        Uses PyArrow Parquet format to preserve all pandas dtypes including:
+        Uses orjson for fast serialization with dtype hints for reconstruction.
+        Handles pandas/numpy types including:
         - int64, float64, bool
-        - datetime64[ns] with timezone support
-        - categorical data
+        - datetime64[ns] (serialized as ISO strings)
+        - categorical data (dtype hint preserved)
         - nullable integer/boolean dtypes
 
         Args:
             var_name: Variable name in sandbox
 
         Returns:
-            Tuple of (assignment_code, parquet_bytes, "parquet")
+            Tuple of (assignment_code, json_bytes, "json")
         """
-        if not PYARROW_AVAILABLE:
-            # Fall back to JSON serialization
+        if not PANDAS_AVAILABLE:
             return None, None, None
 
-        buffer = io.BytesIO()
-        try:
-            self.data.to_parquet(
-                buffer,
-                engine="pyarrow",
-                index=True,
-                compression="snappy"
-            )
-            parquet_bytes = buffer.getvalue()
-        except Exception:
-            # Fallback: convert problematic columns to string
-            df_copy = self.data.copy()
-            for col in df_copy.columns:
-                try:
-                    test_buffer = io.BytesIO()
-                    df_copy[[col]].to_parquet(test_buffer, engine="pyarrow")
-                except Exception:
-                    df_copy[col] = df_copy[col].astype(str)
-
-            buffer = io.BytesIO()
-            df_copy.to_parquet(buffer, engine="pyarrow", index=True, compression="snappy")
-            parquet_bytes = buffer.getvalue()
-
-        assignment_code = f"{var_name} = pd.read_parquet('/tmp/dspy_vars/{var_name}.parquet')"
-        return assignment_code, parquet_bytes, "parquet"
+        json_bytes = _serialize_df_to_json(self.data)
+        
+        # Generate code that reads and reconstructs the DataFrame
+        assignment_code = f'''{var_name} = pd.DataFrame(orjson.loads(open('/tmp/dspy_vars/{var_name}.json', 'rb').read())['records'])'''
+        
+        return assignment_code, json_bytes, "json"
 
     @classmethod
     def from_sandbox(cls, data: Any) -> "DataFrame":
@@ -189,8 +252,14 @@ class DataFrame(Type):
 
         if _is_dataframe(data):
             return cls(data=data)
-        elif isinstance(data, (list, dict)):
+        elif isinstance(data, list):
             return cls(data=pd.DataFrame(data))
+        elif isinstance(data, dict):
+            return cls(data=pd.DataFrame(data))
+        elif isinstance(data, bytes):
+            # Reconstruct from JSON bytes
+            df = _deserialize_json_to_df(data)
+            return cls(data=df)
         return None
 
     def rlm_preview(self, max_chars: int = 500) -> str:
