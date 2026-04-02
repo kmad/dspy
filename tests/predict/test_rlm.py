@@ -1372,5 +1372,192 @@ class TestPrepareSerializableVars:
         assert mock.call_count == 2
 
 
+# ============================================================================
+# Unit Tests: SandboxSerializable as OutputField
+# ============================================================================
+
+
+class _StubOutputSerializable(SandboxSerializable):
+    """SandboxSerializable that supports both input and output for testing."""
+
+    def __init__(self, data: str = "stub_data"):
+        self.data = data
+
+    def sandbox_setup(self) -> str:
+        return "import json"
+
+    def to_sandbox(self) -> bytes:
+        return self.data.encode("utf-8")
+
+    def sandbox_assignment(self, var_name: str, data_expr: str) -> str:
+        return f"{var_name} = {data_expr}"
+
+    def rlm_preview(self, max_chars: int = 500) -> str:
+        return f"StubOutput({self.data})"
+
+    @classmethod
+    def sandbox_output_setup(cls) -> str:
+        return "import json"
+
+    @classmethod
+    def sandbox_output_serialize(cls, var_expr: str) -> str:
+        return f"json.dumps({var_expr})"
+
+    @classmethod
+    def from_sandbox_output(cls, data: str) -> "_StubOutputSerializable":
+        import json
+        return cls(json.loads(data) if isinstance(data, str) else data)
+
+    def __eq__(self, other):
+        return isinstance(other, _StubOutputSerializable) and self.data == other.data
+
+
+class TestOutputFieldsInfo:
+    """Tests for _get_output_fields_info with SandboxSerializable output types."""
+
+    def test_simple_types_unchanged(self):
+        """Simple types like str, int should be handled as before."""
+        rlm = RLM("query -> name: str, count: int", max_iterations=3)
+        fields = rlm._get_output_fields_info()
+        assert len(fields) == 2
+        assert fields[0] == {"name": "name", "type": "str"}
+        assert fields[1] == {"name": "count", "type": "int"}
+
+    def test_serializable_output_includes_metadata(self):
+        """SandboxSerializable output fields should include serialization metadata."""
+        import dspy
+        sig = (
+            dspy.Signature({}, "")
+            .append("query", dspy.InputField(), type_=str)
+            .append("result", dspy.OutputField(), type_=_StubOutputSerializable)
+        )
+        rlm = RLM(sig, max_iterations=3)
+        fields = rlm._get_output_fields_info()
+        assert len(fields) == 1
+        result_info = fields[0]
+        assert result_info["name"] == "result"
+        assert result_info["serializable"] is True
+        assert result_info["setup"] == "import json"
+        assert "json.dumps(result)" in result_info["serialize_expr"]
+
+    def test_mixed_output_fields(self):
+        """Mixed signature with str, float, and SandboxSerializable output fields."""
+        import dspy
+        sig = (
+            dspy.Signature({}, "")
+            .append("query", dspy.InputField(), type_=str)
+            .append("summary", dspy.OutputField(), type_=str)
+            .append("score", dspy.OutputField(), type_=float)
+            .append("result", dspy.OutputField(), type_=_StubOutputSerializable)
+        )
+        rlm = RLM(sig, max_iterations=3)
+        fields = rlm._get_output_fields_info()
+        assert len(fields) == 3
+
+        summary_info = fields[0]
+        assert summary_info["name"] == "summary"
+        assert summary_info["type"] == "str"
+        assert "serializable" not in summary_info
+
+        score_info = fields[1]
+        assert score_info["name"] == "score"
+        assert score_info["type"] == "float"
+        assert "serializable" not in score_info
+
+        result_info = fields[2]
+        assert result_info["name"] == "result"
+        assert result_info["serializable"] is True
+
+
+class TestProcessFinalOutputWithSerializable:
+    """Tests for _process_final_output with SandboxSerializable output fields."""
+
+    def test_serializable_output_reconstructed(self):
+        """SandboxSerializable output field should be reconstructed via from_sandbox_output."""
+        import dspy
+        sig = (
+            dspy.Signature({}, "")
+            .append("query", dspy.InputField(), type_=str)
+            .append("result", dspy.OutputField(), type_=_StubOutputSerializable)
+        )
+        rlm = RLM(sig, max_iterations=3)
+        raw = FinalOutput({"result": '"hello"'})  # JSON-encoded string from sandbox
+        parsed, error = rlm._process_final_output(raw, ["result"])
+        assert error is None
+        assert isinstance(parsed["result"], _StubOutputSerializable)
+        assert parsed["result"].data == "hello"
+
+    def test_mixed_outputs_parsed_correctly(self):
+        """Mixed str + float + SandboxSerializable all parsed correctly."""
+        import dspy
+        sig = (
+            dspy.Signature({}, "")
+            .append("query", dspy.InputField(), type_=str)
+            .append("summary", dspy.OutputField(), type_=str)
+            .append("score", dspy.OutputField(), type_=float)
+            .append("result", dspy.OutputField(), type_=_StubOutputSerializable)
+        )
+        rlm = RLM(sig, max_iterations=3)
+        raw = FinalOutput({
+            "summary": "a]summary",
+            "score": 3.14,
+            "result": '"reconstructed"',
+        })
+        parsed, error = rlm._process_final_output(raw, ["summary", "score", "result"])
+        assert error is None
+        assert parsed["summary"] == "a]summary"
+        assert parsed["score"] == 3.14
+        assert isinstance(parsed["result"], _StubOutputSerializable)
+        assert parsed["result"].data == "reconstructed"
+
+    def test_forward_with_serializable_output(self):
+        """Full forward() pass with a SandboxSerializable output field."""
+        import dspy
+        sig = (
+            dspy.Signature({}, "")
+            .append("query", dspy.InputField(), type_=str)
+            .append("result", dspy.OutputField(), type_=_StubOutputSerializable)
+        )
+        mock = MockInterpreter(responses=[
+            FinalOutput({"result": '"from_sandbox"'}),
+        ])
+        rlm = RLM(sig, max_iterations=3, interpreter=mock)
+        rlm.generate_action = make_mock_predictor([
+            {"reasoning": "Done", "code": 'SUBMIT(result=json.dumps(my_result))'},
+        ])
+
+        result = rlm.forward(query="test")
+        assert isinstance(result.result, _StubOutputSerializable)
+        assert result.result.data == "from_sandbox"
+
+    def test_forward_mixed_outputs(self):
+        """Full forward() with str, float, and SandboxSerializable output fields."""
+        import dspy
+        sig = (
+            dspy.Signature({}, "")
+            .append("query", dspy.InputField(), type_=str)
+            .append("summary", dspy.OutputField(), type_=str)
+            .append("score", dspy.OutputField(), type_=float)
+            .append("result", dspy.OutputField(), type_=_StubOutputSerializable)
+        )
+        mock = MockInterpreter(responses=[
+            FinalOutput({
+                "summary": "looks good",
+                "score": 0.95,
+                "result": '"final_data"',
+            }),
+        ])
+        rlm = RLM(sig, max_iterations=3, interpreter=mock)
+        rlm.generate_action = make_mock_predictor([
+            {"reasoning": "All done", "code": 'SUBMIT(summary="looks good", score=0.95, result=json.dumps(data))'},
+        ])
+
+        result = rlm.forward(query="test")
+        assert result.summary == "looks good"
+        assert result.score == 0.95
+        assert isinstance(result.result, _StubOutputSerializable)
+        assert result.result.data == "final_data"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

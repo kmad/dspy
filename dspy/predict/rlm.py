@@ -340,15 +340,31 @@ class RLM(Module):
     # Input/Output Processing
     # =========================================================================
 
+    @staticmethod
+    def _is_sandbox_output_serializable(annotation: Any) -> bool:
+        """Check if an annotation type supports sandbox output serialization.
+
+        Checks the class's own __dict__ to avoid matching Protocol stubs
+        inherited by subclasses that don't implement output support.
+        """
+        if not isinstance(annotation, type):
+            return False
+        return all(
+            any(method in cls.__dict__ for cls in annotation.__mro__ if cls is not SandboxSerializable)
+            for method in ("sandbox_output_setup", "sandbox_output_serialize", "from_sandbox_output")
+        )
+
     def _get_output_fields_info(self) -> list[dict]:
         """Get output field info for sandbox registration."""
         fields = []
         for name, field in self.signature.output_fields.items():
             annotation = getattr(field, "annotation", str)
             field_info = {"name": name}
-            # Only include type for simple types that work in function signatures
-            # Complex types like Literal, Union, etc. are not included
-            if annotation in SIMPLE_TYPES:
+            if self._is_sandbox_output_serializable(annotation):
+                field_info["serializable"] = True
+                field_info["setup"] = annotation.sandbox_output_setup()
+                field_info["serialize_expr"] = annotation.sandbox_output_serialize(name)
+            elif annotation in SIMPLE_TYPES:
                 field_info["type"] = annotation.__name__
             fields.append(field_info)
         return fields
@@ -531,8 +547,11 @@ class RLM(Module):
             field = self.signature.output_fields[name]
             annotation = getattr(field, "annotation", str)
             try:
-                parsed_outputs[name] = parse_value(raw_output[name], annotation)
-            except (ValueError, pydantic.ValidationError) as e:
+                if self._is_sandbox_output_serializable(annotation):
+                    parsed_outputs[name] = annotation.from_sandbox_output(raw_output[name])
+                else:
+                    parsed_outputs[name] = parse_value(raw_output[name], annotation)
+            except (ValueError, TypeError, KeyError, pydantic.ValidationError) as e:
                 type_errors.append(
                     f"{name}: expected {annotation.__name__ if hasattr(annotation, '__name__') else annotation}, "
                     f"got {type(raw_output[name]).__name__}: {e}"

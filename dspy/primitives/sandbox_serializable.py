@@ -80,6 +80,35 @@ class SandboxSerializable(Protocol):
         """Return an LLM-friendly preview of this value."""
         ...
 
+    # --- Output (sandbox → host) methods ---
+
+    @classmethod
+    def sandbox_output_setup(cls) -> str:
+        """Return Python import statements needed in the sandbox for output serialization."""
+        ...
+
+    @classmethod
+    def sandbox_output_serialize(cls, var_expr: str) -> str:
+        """Return a Python expression that serializes var_expr to a JSON-safe string.
+
+        This code runs INSIDE the sandbox. The expression should produce a ``str``
+        that can survive ``json.dumps`` and be passed to ``from_sandbox_output``
+        on the host to reconstruct the value.
+
+        Args:
+            var_expr: The variable name/expression to serialize in the sandbox.
+        """
+        ...
+
+    @classmethod
+    def from_sandbox_output(cls, data: str) -> "SandboxSerializable":
+        """Reconstruct the value on the HOST from the serialized sandbox output.
+
+        Args:
+            data: The string produced by ``sandbox_output_serialize`` inside the sandbox.
+        """
+        ...
+
     def to_repl_variable(self, name: str, field_info: FieldInfo | None = None) -> REPLVariable:
         """Build a REPLVariable using rlm_preview().
 

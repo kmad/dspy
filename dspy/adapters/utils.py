@@ -83,6 +83,18 @@ def _get_json_schema(field_type):
     return schema
 
 
+def _is_sandbox_serializable_type(field_type: Any) -> bool:
+    """Check if a type implements the SandboxSerializable output protocol."""
+    from dspy.primitives.sandbox_serializable import SandboxSerializable
+
+    if not inspect.isclass(field_type):
+        return False
+    return all(
+        any(method in cls.__dict__ for cls in field_type.__mro__ if cls is not SandboxSerializable)
+        for method in ("sandbox_output_setup", "sandbox_output_serialize", "from_sandbox_output")
+    )
+
+
 def translate_field_type(field_name, field_info):
     field_type = field_info.annotation
 
@@ -103,6 +115,8 @@ def translate_field_type(field_name, field_info):
         )
     elif inspect.isclass(field_type) and issubclass(field_type, Code) and field_type.description():
         # Code has a rich type description already; avoid duplicating its large schema block.
+        desc = ""
+    elif _is_sandbox_serializable_type(field_type):
         desc = ""
     else:
         desc = f"must adhere to the JSON schema: {json.dumps(_get_json_schema(field_type), ensure_ascii=False)}"

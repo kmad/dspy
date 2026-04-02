@@ -80,11 +80,29 @@ def SUBMIT(output):
     if (o.type) part += `: ${o.type}`;
     return part;
   });
+
+  // Collect setup imports and per-field serialization for SandboxSerializable outputs
+  const setupLines = new Set();
+  const serializeLines = [];
+  for (const o of outputs) {
+    if (o.serializable && o.setup) {
+      for (const line of o.setup.split('\n')) {
+        if (line.trim()) setupLines.add(line.trim());
+      }
+    }
+    if (o.serializable && o.serialize_expr) {
+      serializeLines.push(`    ${o.name} = ${o.serialize_expr}`);
+    }
+  }
+
+  const setupBlock = setupLines.size > 0 ? `    ${[...setupLines].join('\n    ')}\n` : '';
+  const serializeBlock = serializeLines.length > 0 ? serializeLines.join('\n') + '\n' : '';
+
   const dictParts = outputs.map(o => `"${o.name}": ${o.name}`);
 
   return `
 def SUBMIT(${sigParts.join(', ')}):
-    raise FinalOutput({${dictParts.join(', ')}})
+${setupBlock}${serializeBlock}    raise FinalOutput({${dictParts.join(', ')}})
 `;
 };
 

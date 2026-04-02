@@ -98,5 +98,23 @@ class DataFrame(SandboxSerializable):
         preview = "\n".join(lines)
         return preview[:max_chars] + "..." if len(preview) > max_chars else preview
 
+    # SandboxSerializable output protocol
+
+    @classmethod
+    def sandbox_output_setup(cls) -> str:
+        return "import pandas as pd\nimport base64\nimport io"
+
+    @classmethod
+    def sandbox_output_serialize(cls, var_expr: str) -> str:
+        return f"base64.b64encode({var_expr}.to_parquet(index=False)).decode('ascii')"
+
+    @classmethod
+    def from_sandbox_output(cls, data: str) -> "DataFrame":
+        import base64
+        import io
+
+        pd = __import__("pandas")
+        return cls(pd.read_parquet(io.BytesIO(base64.b64decode(data))))
+
     def __repr__(self) -> str:
         return f"DataFrame({self.data.shape[0]} rows x {self.data.shape[1]} cols)"
